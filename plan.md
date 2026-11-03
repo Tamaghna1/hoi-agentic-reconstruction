@@ -549,3 +549,84 @@ https://github.com/Tamaghna1/hoi-agentic-reconstruction, commit 493cb073bbfe162c
 Both gates from the prior instruction (repository setup + pre-experiment audit) are
 now satisfied. Proceeding to re-verify prerequisites still pass, then launch the
 approved A/B/C experiments.
+
+## 2026-11-04 (cont.) - A/B/C EXPERIMENTS LAUNCHED
+
+Both gates satisfied (repo setup verified pushed, pre-experiment audit passed clean).
+Final prerequisite spot-check before launch: MANO/DINO/MC1 all present, 0 jobs
+running, confirmed clean slate.
+
+- scripts/run_condition_{A,B,C}.sh written: each activates agile-optim, sets
+  CUDA_HOME/TORCH_CUDA_ARCH_LIST=8.6/DINO_MODEL_PATH, attempts W&B logging
+  (nonfatal), then runs 'python scripts/run_experiment.py --condition {A,B,C}'
+  (the real, non-check-only path) - released config + approved window
+  (start_frame=10, end_frame=200) + exactly one condition-specific delta each,
+  proven correct by the final wrapper_check_only validation (job 73225).
+- Submitted all three via tmux_job.sh (each with its own 3-window log/err/status
+  viewer): 
+  - Job 73230 (exp_A, released baseline) - RUNNING on cn2.
+  - Job 73231 (exp_B, +object_smoothness_loss) - RUNNING on cn3.
+  - Job 73232 (exp_C, +object_max_iter_per_frame=800) - PENDING, reason
+    AssocMaxJobsLimit - correctly queued, respecting the account's MaxJobs=2
+    running-job cap (MaxSubmit=4 not exceeded with all 3 submitted). Will start
+    automatically once A or B completes.
+  - Partition list for all three: short,long,a100,medium,ada (broadest available,
+    scheduler picks whichever frees first) - gres=gpu:1, mem=24G, cpus=4,
+    time=6:00:00 (generous estimate based on the smoke test's 3-keyframe/9min
+    pace scaled to the ~40-keyframe real window, with margin).
+  - Output dirs: results/{A_released,B_smoothness,C_control_iters800}/ - isolated,
+    verified non-overlapping by construction (result_dir()/log_dir() map 1:1 to
+    condition name).
+
+## 2026-11-04 (cont.) - A and B COMPLETED; output-isolation bug found and fixed
+
+### Condition A (job 73230): COMPLETED, exit 0:0, elapsed 01:12:33 (4346s)
+### Condition B (job 73231): COMPLETED, exit 0:0, elapsed 00:57:10 (3405s)
+Both: "[Bidirectional] Saving combined result: 2 backward + 38 forward = 40 frames",
+matching expectation (stride-5 hold_mode over the 10-200 window). Final object
+scales: A=0.9299, B=0.9219 (plausibly different given B's extra smoothness term;
+not yet rigorously compared - see next step).
+
+### FINDING: A/B/C output isolation was NOT actually achieved as claimed, root cause fixed
+- results/A_released/ and results/B_smoothness/ contain ONLY my wrapper's own
+  effective_config.json/run_manifest.json - the REAL AGILE output (aligned/,
+  object_poses.npz, videos, etc.) landed instead under
+  results/MC1/<timestamp>_<loss_info>/ - a path AGILE auto-generated itself.
+- ROOT CAUSE (verified against AGILE's actual source, not assumed): AGILE's
+  Config.result_dir field was never set by run_experiment.py's
+  load_scene_overrides() - only my OWN result_dir(condition) helper function
+  existed, used solely for where to write MY wrapper's manifest files, never
+  inserted into the effective config dict passed to Config(**effective). With
+  result_dir=None, Config.get_result_dir() (confirmed via source fetch of
+  optimization/config/config.py) auto-generates results/{scene}/{timestamp}_
+  {loss_info}[_{mode_info}], where loss_info/mode_info are built from which loss
+  flags are enabled (mask, depth, normal, contact, smoothness, feature/type,
+  lastframe, handscale) - NOT from object_max_iter_per_frame, meaning condition C's
+  auto-generated name is distinguishable from A's ONLY by timestamp.
+- CONSEQUENCE, verified not assumed: no actual data collision occurred between A
+  and B (different timestamps, and B's name additionally includes
+  "smoothness0.0002"). C (still running under the OLD buggy Config object
+  constructed before this fix) will also land in an auto-generated path, distinct
+  from A's only by timestamp - confirmed distinct by directory listing
+  (results/MC1/1104_021134_mask5.0_feature10.0_typelocal_lastframe/ exists
+  separately from A's 1104_011226_... directory).
+- ACTUAL CURRENT DATA LOCATIONS (verified via filesystem, not assumed):
+  - Condition A: results/MC1/1104_011226_mask5.0_feature10.0_typelocal_lastframe/
+  - Condition B: results/MC1/1104_011508_mask5.0_smoothness0.0002_feature10.0_typelocal_lastframe/
+  - Condition C (in progress): results/MC1/1104_021134_mask5.0_feature10.0_typelocal_lastframe/
+- FIX APPLIED (verified via --check-only re-run, not consuming a GPU job slot):
+  load_scene_overrides() no longer sets result_dir; build_effective_config() now
+  sets reference["result_dir"] = str(result_dir(condition)) BEFORE effective is
+  copied from reference, so it is identical in both and does not appear in the
+  single-field-diff check. Re-ran --check-only for A and B: diffs still exactly
+  correct ([], [object_smoothness_loss]); confirmed effective_config.json's
+  result_dir field now correctly resolves to e.g.
+  /scratch/users/anirban/tamaghnam/HOI/results/A_released. This fix is NOT yet
+  applied to the already-running condition C (its Config object was constructed
+  before the fix existed - not interfering with a running job).
+- NOT YET DECIDED: whether to move the already-completed A/B (and eventually C)
+  output from their auto-generated locations into the originally-intended
+  results/{A_released,B_smoothness,C_control_iters800}/ directories, or to
+  document and use the actual auto-generated paths going forward. Flagged to user,
+  not decided unilaterally - results/ is gitignored/not version-controlled, so any
+  move would need explicit care.

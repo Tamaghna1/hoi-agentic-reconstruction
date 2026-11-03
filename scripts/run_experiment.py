@@ -79,6 +79,11 @@ def load_scene_overrides():
         "mano_model_path": str(MANO_ROOT),
         "start_frame": entry["contact_frame"],
         "end_frame": WINDOW_END,
+        # NOTE: result_dir is intentionally NOT set here - it is condition-specific
+        # and is added in build_effective_config() below, per condition, so that
+        # AGILE's Config.get_result_dir() uses our isolated directory directly
+        # instead of falling back to its own auto-generated results/{scene}/{timestamp}_
+        # {loss_info} path (a real bug found after A/B/C's first real run - see plan.md).
     }
 
 
@@ -99,6 +104,14 @@ def build_effective_config(condition):
 
     reference = dict(base)
     reference.update(scene_overrides)
+    # Set explicitly, identically in reference (and therefore effective, via the
+    # copy below) so AGILE's Config.get_result_dir() uses our isolated directory
+    # directly instead of auto-generating its own results/{scene}/{timestamp}_
+    # {loss_info} path. Setting it here (not inside CONDITIONS' per-condition
+    # delta) keeps it out of the single-field-diff check - it is infrastructure,
+    # not a research setting, and is identical in reference/effective by
+    # construction so it can never appear as an unintended diff.
+    reference["result_dir"] = str(result_dir(condition))
 
     delta = CONDITIONS[condition]
     effective = dict(reference)
