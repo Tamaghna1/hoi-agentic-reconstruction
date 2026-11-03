@@ -484,3 +484,68 @@ Every stage (MANO, DINO, CUDA extensions, data loading, bidirectional optimizati
 output writing) is now genuinely verified working on real data with real compute.
 Pipeline is ready for the approved A/B/C runs, pending user authorization to launch
 them and pending resolution of the git repo/remote question for the commit+push step.
+
+## 2026-11-04 (cont.) - GitHub repository setup
+
+- Repo created by user: https://github.com/Tamaghna1/hoi-agentic-reconstruction
+- Verified remote state before touching anything: 'git ls-remote' returned exit 0,
+  empty output - confirmed genuinely empty repo (not an auth failure), safe to push
+  without any overwrite risk.
+- Found an untracked results/-adjacent directory, debug/ (AGILE's own generated
+  mesh/texture debug output from the smoke test), added to .gitignore alongside
+  *.obj/*.mtl/*.glb/*.ply/*.mp4 extensions for defense in depth.
+- 'git init' in HOI/ (was NOT already a repo, confirmed first). Remote 'origin' set
+  to the exact URL above. Branch renamed to 'main'.
+- Staged explicitly (.gitignore, plan.md, scripts/ only - never git add -A).
+  git status before commit showed exactly these three items as untracked; nothing
+  from assets/, data/, logs/, repo/, results/, debug/ appeared at all.
+- Scanned the staged diff for credential patterns before committing - one harmless
+  false positive (plain-English text describing an SSH permission error in plan.md).
+- COMMITTED locally: 493cb07 "Initial commit: HOI/AGILE project infrastructure,
+  scripts, and plan.md" (21 files, 2255 insertions).
+- PUSH FAILED: "Invalid username or token. Password authentication is not supported
+  for Git operations." The cluster's stored credential (credential.helper=store) is
+  stale/invalid. Checked Mac-side fallback: gh is not authenticated there either, no
+  credential helper configured. BLOCKED on user action - did not attempt any token-based
+  workaround. User must either (a) run a manual git push on the cluster once,
+  entering username + a fresh PAT when prompted, letting credential.helper cache it,
+  or (b) run 'gh auth login' on the Mac so pushes can happen from there instead.
+  Commit is safe, unpushed, locally on the cluster - nothing lost.
+- Re-ran scripts/run_wrapper_check.sh (long -> short partition, also found and fixed:
+  it never exported DINO_MODEL_PATH, a gap in the check SCRIPT's own job environment,
+  not evidence DINO itself was missing - DINO was already independently verified
+  working earlier). Job 73225, COMPLETED exit 0:0: all three conditions (A/B/C) now
+  pass EVERY prerequisite check cleanly, config diffs still exactly correct
+  (A: none, B: [object_smoothness_loss], C: [object_max_iter_per_frame]).
+
+## STATUS: pre-experiment audit PASSED. Repository setup PARTIAL - committed locally,
+push blocked on user's GitHub authentication action (cluster or Mac side). Per the
+user's own stated two-part gate ("if repository setup and the pre-experiment audit
+both pass, proceed with A/B/C"), NOT launching the real A/B/C experiments yet -
+waiting for either the push to succeed or explicit instruction to proceed anyway.
+
+## 2026-11-04 (cont.) - GitHub push resolved via dedicated SSH deploy key
+
+- Inspected ~/.ssh first: no existing keys, no config - nothing at risk of being
+  overwritten.
+- Generated a dedicated Ed25519 keypair (~/.ssh/hoi_agentic_reconstruction_deploy_ed25519),
+  permissions 600 (private)/644 (public). Private key never printed/transmitted.
+  Wrote ~/.ssh/config scoping it to Host github.com (IdentitiesOnly yes).
+- Gave the user the public key only, with exact GitHub deploy-key UI instructions.
+  Did not attempt any push until the user confirmed the key was added with write
+  access.
+- Tested SSH auth: "Hi Tamaghna1/hoi-agentic-reconstruction! You've successfully
+  authenticated" - confirms the key is correctly scoped to exactly this repo.
+- Re-verified before pushing: remote still genuinely empty (git ls-remote exit 0,
+  no output), branch main at exactly 493cb07, no unexpected remote content.
+- Switched origin to git@github.com:Tamaghna1/hoi-agentic-reconstruction.git,
+  pushed with 'git push -u origin main' - no force flag used, no history rewrite.
+- VERIFIED: local HEAD and origin/main both equal
+  493cb073bbfe162c87d0734a948e3b630d78d432 exactly; confirmed visible via
+  'git ls-remote origin'.
+
+## STATUS: GitHub push RESOLVED AND VERIFIED. Repository: 
+https://github.com/Tamaghna1/hoi-agentic-reconstruction, commit 493cb073bbfe162c87d0734a948e3b630d78d432 on branch main.
+Both gates from the prior instruction (repository setup + pre-experiment audit) are
+now satisfied. Proceeding to re-verify prerequisites still pass, then launch the
+approved A/B/C experiments.
