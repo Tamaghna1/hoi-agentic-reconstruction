@@ -761,3 +761,264 @@ convergence-checking source code in this pass - this comparison is reported as a
 observed pattern, not a conclusion about whether C's extra iterations helped or
 hurt convergence, since the status labels' exact criteria are not fully
 understood yet.
+
+## SOURCE-LEVEL DIAGNOSTIC INVESTIGATION (2026-11-04)
+
+Investigation requested before any Condition D authorization. All A/B/C outputs
+left untouched (read-only inspection + log/config analysis only). No saved data
+was modified. No new experiments launched.
+
+### 1. Convergence semantics — traced to source
+
+**Files**: `optimization/optim/convergence.py` (`ConvergenceMonitor.observe`, lines 17-31),
+`optimization/optim/object_optimizer.py` (lines 312, 543-549), `optimization/optim/hand_optimizer.py`
+(lines 293, 440-446).
+
+`ConvergenceMonitor.observe(loss, step, gradient, phase)` keeps a 5-sample sliding window
+(`deque(maxlen=5)`) of `(loss, step_norm, max_grad)` per iteration. On each call, once the
+window is full, it computes:
+- `small_step = max(steps) < step_tol`   (`step_tol` = `cfg.online_converge_thresh` = `1e-4`, explicitly set in the released `ho3d.json`, confirmed identical in A and C's `effective_config.json`)
+- `stable_loss = max(losses)-min(losses) <= loss_rtol * max(1, abs(losses[0]))`  (`loss_rtol` = `cfg.converge_loss_rtol`, **dataclass default `1e-5`** — not present as an explicit key in the released `ho3d.json` or our `effective_config.json` dumps; governs via `Config`'s dataclass default, confirmed by reading `config.py` line 322, not by our own manifest, which only records explicitly-set keys — **flagged below as a manifest completeness gap**)
+- gradient check: `max(grads) < grad_tol`  (`grad_tol` = `cfg.converge_grad_tol`, dataclass default `1e-3`, config.py line 323, same manifest caveat)
+
+Returns, in this exact priority:
+- `'converged'` only if **all three** (small step AND stable loss AND small gradient) hold.
+- `'stalled'` if `small_step` holds but at least one of the other two does not.
+- `'optimizing'` otherwise (step itself not yet small).
+
+The per-frame optimization loop (`object_optimizer.py` train_one_frame, `hand_optimizer.py`
+train_one_frame) calls `convergence.observe(...)` every iteration and breaks early only when
+`convergence_status == 'converged'`. After the loop exits (by `break` or by exhausting
+`train_max_iter`), the final status recorded to `[Convergence]` is:
+```
+status = 'converged' if converged else ('stalled_at_budget' if convergence_status == 'stalled' else 'budget_exhausted')
+```
+(`object_optimizer.py` line 544; `hand_optimizer.py` line 441 — identical logic, independently
+implemented per component.)
+
+**Answers, direct from source, not inferred from naming:**
+- **Are the three statuses mutually exclusive?** Yes, by construction — a single `if/elif/else`
+  on the *last* observed `convergence_status`; no code path can produce two simultaneously.
+- **Does `stalled_at_budget` mean progress stopped, or just that the budget was reached?**
+  Neither, precisely — it means the **parameter step size** was small (<1e-4) on the final
+  5-iteration window, but loss and/or gradient did **not** clear their thresholds. The code's
+  own comment (`object_optimizer.py` line ~536, duplicated at `hand_optimizer.py` line ~390):
+  *"LR decay can make updates tiny while the objective gradient is large. Report that as
+  stalled and retain the configured iteration budget."* This is an explicit acknowledgment
+  that `stalled_at_budget` can be an **LR-schedule artifact** (the Adam scheduler decays step
+  size toward the end of the fixed `train_max_iter` budget regardless of whether the true
+  gradient has gone to zero) rather than genuine convergence or a genuine plateau. It is
+  **not** a certificate that optimization "stopped making progress" in the loss/gradient
+  sense — only that *parameter updates* became small.
+- **`budget_exhausted`** means the step size itself was *still above* `step_tol` when the
+  iteration budget ran out — i.e., the optimizer was still taking non-negligible steps when
+  the loop ended. This is the stronger signal of a genuinely insufficient iteration budget.
+- **Are gradients, losses, and parameter changes actually checked?** Yes, all three, but only
+  `'converged'` requires all three simultaneously; `'stalled'` requires only the step-size
+  criterion, which is why it can fire even with a large gradient still present.
+- **Does the optimizer retain useful per-iteration information not saved in our outputs?**
+  Yes. Per-iteration loss/step/gradient values exist transiently inside `ConvergenceMonitor`'s
+  5-sample window and are discarded after each frame. There IS a TensorBoard path
+  (`runner.tb_writer`, `trainer.py` line 88, logging per-iteration loss/pose_change per frame
+  in both optimizers) — but **we confirmed no `tfevents` files exist anywhere under
+  `results/` or `logs/` for A/B/C** (checked via `find -iname "*tfevents*"`, empty), meaning
+  `cfg.tb_dir`/logging was never configured for these runs. The only persisted per-iteration
+  signal is the rounded-to-4-decimals `desc` string in stdout/stderr (e.g.
+  `alpha_loss=0.4283 feature_loss=5.8663 smoothness_loss=0.0000 ho_loss=0.1192`) and the single
+  final `[Convergence]` summary event per frame/component. Full per-iteration trajectories are
+  **not recoverable** from existing outputs.
+
+**Manifest completeness gap (new finding, not a correctness bug):** our own
+`run_experiment.py`'s `effective_config.json` only records keys explicitly present in the
+released `ho3d.json` + scene overrides + condition delta. `converge_loss_rtol` and
+`converge_grad_tol` are never explicitly set by the released config, so they are **absent**
+from our manifest (not `null`-valued — simply missing keys), and the actual governing values
+come from `Config`'s Python dataclass defaults. This means our manifest alone cannot fully
+reconstruct the effective runtime configuration for these two fields — verified instead by
+reading `config.py` directly. Noted as a reproducibility-documentation gap; does not affect
+correctness of the completed A/B/C runs.
+
+### 2. Invariant hand rotation — traced to source, finding CORRECTED from "unexplained"
+
+**Files**: `optimization/optim/hand_optimizer.py` (`_initialize_hand_pose`, lines 41-56; main
+loop lines 238, 290, 298, 451), `optimization/pipelines/trainer.py`
+(`save_optimized_data`, lines ~853-868).
+
+- `hand_optimizer.py` line 238: `rvec = torch.nn.Parameter(torch.zeros(3, device=device),
+  requires_grad=not cfg.fix_hand_rotation_to_wilor)` — under `fix_hand_rotation_to_wilor=True`
+  (the released setting used by all of A/B/C), `rvec.requires_grad=False`: **rotation is never
+  optimized**, only translation (`tvec`) is. This is deliberate, documented in `config.py`'s
+  own comment on the field (lines ~232-236): *"Keep each frame's original WiLoR global
+  rotation exactly: skip hand PnP initialization and rotation updates... Translation remains
+  optimizable."*
+- `_initialize_hand_pose` (line ~46-49): `original_R = runner.trainset[frame_id]['mano_global_orient']`
+  — this **is** read fresh per frame from the dataset (the per-frame WiLoR estimate genuinely
+  varies frame to frame; rotation is not globally constant in the underlying data).
+- In the per-iteration loop (line 298, repeated at line 451): `new_R = base_R if
+  cfg.fix_hand_rotation_to_wilor else rotation_vector_to_matrix_safe(...)` — `new_R` is
+  literally `base_R` (the per-frame WiLoR rotation), held fixed for all iterations of that
+  frame's hand optimization.
+- **The decisive step is at export**, `trainer.py` `save_optimized_data`:
+  ```python
+  if self.cfg.fix_hand_rotation_to_wilor:
+      if not torch.equal(hand_R, mano_global_orient):
+          raise ValueError('Fixed WiLoR hand rotation changed before export')
+      # The saved transform is relative to the original WiLoR
+      # orientation. Identity preserves it without conversion.
+      hand_rvec = torch.zeros(3, dtype=hand_R.dtype)
+      hand_R = torch.eye(3, dtype=hand_R.dtype)
+  ```
+  The code **explicitly overwrites** the saved rotation with `torch.eye(3)` / `zeros(3)`
+  whenever `fix_hand_rotation_to_wilor=True`, by design: the saved field is defined as "rotation
+  relative to this frame's own original WiLoR orientation," which is trivially identity when
+  rotation was never changed from that same per-frame WiLoR value. This identity matrix is
+  then appended to `final_hand_rotations` and written to `mano_transforms.npz`'s
+  `rotation_matrices` field (`trainer.py` line 903) — **the exact field our
+  `analyze_temporal_consistency.py` reads** (confirmed in that script's own header comment
+  and `analyze_hand()` function, which consumes `rotation_matrices`/`translations` from
+  `mano_transforms.npz`).
+
+**Direct answers:**
+- **Why exactly invariant?** Because the export code hard-codes `hand_R = eye(3)` for every
+  frame under this config branch — not because the underlying hand orientation is actually
+  constant, and not because of any bug in our analysis.
+- **Are hand translation and articulation optimized independently of rotation?** Yes —
+  translation (`tvec`) is always optimized via its own Adam optimizer regardless of
+  `fix_hand_rotation_to_wilor`; MANO pose articulation is optimized only if `optimize_hand_pose`
+  is separately enabled (`False` in the released config — not optimized here at all).
+- **Is the saved rotation copied from WiLoR, initialized once, or recomputed per frame?**
+  Recomputed (re-read) per frame from `trainset[frame_id]['mano_global_orient']`, then
+  immediately redefined as identity *relative to itself* at save time.
+- **Is our analysis script reading the correct field/convention?** Yes — verified field name
+  (`rotation_matrices` in `mano_transforms.npz`) and verified, via source, that this field's
+  value is guaranteed to be `eye(3)` under the released config, not an analysis bug.
+- **Is a zero rotation delta an expected consequence of the released config, or a possible
+  serialization/analysis issue?** **Expected consequence of the released config**, confirmed
+  by source, not an analysis issue. The true per-frame absolute WiLoR rotation (which does
+  vary) is separately preserved verbatim in `mano_global_orient.npz` (`trainer.py` line
+  858-859, saved straight from `self.parser.mano_global_orient`, unmodified, identical input
+  data across A/B/C since it's not optimized) — but that field was not what our
+  temporal-consistency script analyzed, and since it is identical pre-optimization input data
+  across all three conditions, it carries no information relevant to comparing A/B/C anyway.
+
+**Correction to the previous report**: the earlier framing ("hand rotation delta exactly 0.0,
+flagged as a real finding not fully explained mechanistically") is now **fully explained** by
+source and should no longer be treated as an open question. It is a by-design consequence of
+`fix_hand_rotation_to_wilor=True`'s export convention, carries zero information about actual
+hand-rotation smoothness, and should not be used as evidence of anything about the optimizer's
+behavior in any condition.
+
+### 3. A/B/C comparison audit
+
+- **Was B's smoothness loss actually active and contributing?** Confirmed empirically, not
+  just structurally. Searched A/B/C's full stderr logs (which contain the real per-iteration
+  `desc` strings) for `"[Object].*smoothness_loss="`:
+  - A: **0** occurrences. C: **0** occurrences. B: **31,200** occurrences.
+  (A/C's `object_smoothness_loss=False`, so the term is never added to the object loss dict at
+  all — confirmed absent, not just zero-valued.) This cleanly confirms the manipulation was
+  isolated to B only, as intended — no leakage into A or C.
+  (Separately, `"[Hand].*smoothness_loss="` appears in all three — ~15,600/14,003/15,600 times
+  — but this is `hand_smoothness_loss`, an always-on, non-condition-varied default loss
+  (`config.py` line 151, `True` by default) that the hand optimizer's own
+  `_to_legacy_loss_dict` happens to display under the same generic key name `smoothness_loss`.
+  Confirmed this is a **display-key naming collision only**, unrelated to the object
+  smoothness manipulation under test — cross-checked `object_optimizer.py`'s `_to_legacy_loss_dict`
+  key map, lines 226-238: `'object_smoothness': 'smoothness_loss'`.)
+  - **Precision limitation, newly discovered**: every one of the 31,200 `[Object]` smoothness
+    print lines in B reads exactly `smoothness_loss=0.0000` (4-decimal rounding in the log
+    format string). `object_smoothness_lambda=0.0002` (confirmed in B's `effective_config.json`,
+    matches the released default, `config.py` line 146). A representative full line:
+    `Frame 15 [Object] Iter 249: alpha_loss=0.4283 feature_loss=5.8663 smoothness_loss=0.0000 ho_loss=0.1192`
+    — i.e. the *weighted* smoothness term is at least an order of magnitude smaller than the
+    other three simultaneously-active losses at essentially every iteration sampled, and its
+    true (unrounded) magnitude cannot be recovered from the existing logs (no TensorBoard
+    writer was active — see Section 1). **We can confirm the loss term was structurally wired
+    in, correctly weighted per the released config, and fired on effectively every eligible
+    frame — but we cannot confirm from existing logs whether its gradient contribution was
+    ever large enough, relative to the other active losses, to meaningfully influence the
+    optimization trajectory.** This is a plausible, source-grounded explanation for the
+    near-identical A vs. B temporal-consistency metrics reported previously: a released
+    smoothness weight (2e-4) small enough, relative to mask (5.0)/feature (10.0)/ho_relpose
+    (400.0), that it may simply be too weak to produce a measurable effect — not necessarily
+    evidence that smoothness regularization is ineffective in general.
+- **Did `recover_object_pose_from_mask` (True in the released config) ever disable B's
+  smoothness loss for any frame?** (`object_optimizer.py` line ~375: `if recovered:
+  loss_cfg.object_smoothness_loss = False`.) Checked `[Object recovery]` print events
+  (`recovery.py` line 97) in all three logs: **0 occurrences in A, B, and C.** Recovery never
+  triggered in this scene/window; this confound does not apply here.
+- **Do the reported temporal metrics use the same frames/coordinate convention across A/B/C?**
+  Yes — all three conditions' logs report identical `"Optimized frame range: 0 to 39 (total: 40
+  frames)"` and identical `2 backward + 38 forward` composition (already verified in the prior
+  report); `analyze_temporal_consistency.py` reads the same `object_poses.npz`/
+  `mano_transforms.npz` field names and the same camera-frame convention (`object_poses_in_cam`,
+  a 4x4 matrix in camera coordinates per `trainer.py`'s save code) for every condition — no
+  per-condition divergence in what's being read.
+- **Do the 40 saved frames represent the expected keyframes from the approved MC1 window and
+  stride?** Traced the hold-mode index mapping: `megasam.py` line 67,
+  `hold_indices = np.arange(0, num_frames_before_hold, hold_mode_interval)` subsamples the
+  **entire** sequence by stride 5 *before* windowing, producing a reduced index space where
+  subsampled index `i` corresponds to actual frame `5*i`. `trainer.py` line 1307 enforces
+  `contact_frame % hold_mode_interval == 0`; our approved `start_frame=10` → subsampled index 2.
+  Approved `end_frame=200` → subsampled index 40. Forward pass from index 2 to 40 → **38
+  frames**; backward pass from index 2 down to index 0 → **2 frames**. This exactly matches the
+  observed `2 backward + 38 forward = 40 total` in all three conditions' logs — confirmed
+  correct, not coincidental.
+- **Limitations in interpreting B's null result (consolidated):** (1) the smoothness weight's
+  true unrounded magnitude is unverifiable from existing logs (see above) — the null result may
+  reflect an under-powered released weight rather than a genuine absence of effect; (2) all 240
+  component-optimizations across A/B/C exhausted their iteration budget without satisfying the
+  strict convergence criteria (Section 1), so none of A/B/C represents a settled optimum —
+  differences (or their absence) between conditions are confounded with incomplete optimization
+  under the current fixed-budget/threshold combination; (3) the specific metric compared
+  (object pose geodesic/L2 deltas) is sensitive mainly to the rotation/translation smoothness
+  loss's influence on *pose*, while the implemented `vertices`-type smoothness loss
+  (`optimization/losses/smoothness.py` lines 112-119, `temporal_smoothness_loss_vertices`)
+  penalizes vertex displacement under a *rotation-difference* operator (`dR = prev_R - curr_R`,
+  not a geodesic distance) — a different, non-equivalent mathematical quantity from the
+  geodesic metric we used to compare conditions, so even a real smoothness effect might not be
+  fully captured by our chosen comparison metric.
+
+### 4. Condition D — evaluated, NOT launched, presented for authorization
+
+Given the above, a higher-iteration-budget condition is scientifically justified **to answer a
+narrower question than originally framed**: not "does more compute make AGILE more accurate,"
+but **"does the universal `budget_exhausted`/`stalled_at_budget` non-convergence resolve with a
+substantially larger budget, or is it structural (e.g., threshold values too strict for this
+loss combination, or a genuine non-zero-gradient plateau)?"** This is answerable without new
+code, using only the existing `[Convergence]` status field and loss/gradient values already
+logged.
+
+**Proposed Condition D (recommendation only — awaiting authorization):**
+- Same MC1 sequence, same approved frame window (`start_frame=10, end_frame=200`).
+- Same released configuration as A (baseline, no smoothness) — isolates the iteration-budget
+  question from the smoothness question.
+- Only `object_max_iter_per_frame` changes, from A's `400` to **`1600`** (4x A, 2x C).
+  `hand_max_iter_per_frame` left unchanged at `200` (hand already hits `stalled_at_budget`
+  40/40 across all conditions at this budget; scaling hand iterations is a separate,
+  independently justified follow-up question, not bundled into D).
+- **Budget multiplier justification**: from A (400 iters, 1:12:33) vs. C (800 iters, 1:59:23),
+  the marginal per-iteration object-optimization cost is ≈ (1:59:23 − 1:12:33) / 400 iters /
+  40 frames ≈ 0.176 sec/iteration. A further doubling to 1600 (adding 800 iters/frame over C)
+  is estimated to add ≈ 800 × 0.176 × 40 ≈ 94 minutes over C's runtime, for an estimated total
+  **wall-clock ≈ 3h 30min** (bounded estimate; actual cluster contention/GPU variance not
+  included). This is a single, modest, interpretable step — not an open-ended search — chosen
+  to be large enough to meaningfully test the "needs more compute" hypothesis without
+  committing to a much longer, harder-to-schedule run before we know whether the hypothesis
+  even holds.
+- **Interpretation criteria, fixed in advance:**
+  - If the proportion of `budget_exhausted` (object) drops substantially relative to C's 80%
+    (32/40) — e.g., most frames now report `'converged'` or at least `'stalled_at_budget'`
+    rather than `'budget_exhausted'` — this supports "needs more compute," and a convergence
+    analysis under relaxed/longer budget becomes meaningful.
+  - If the `budget_exhausted`/`stalled_at_budget` proportions are essentially unchanged from C
+    despite 2x more iterations, this supports "structural" (threshold/landscape issue, not
+    simply insufficient time), and further increasing the budget alone would not be a
+    productive next step — the convergence thresholds themselves, or the loss landscape, would
+    need separate investigation instead.
+  - Temporal-consistency metrics (geodesic/L2 deltas) will be recomputed under the same
+    protocol as A/B/C for completeness, but per Section 3's caveats, will be interpreted only
+    as descriptive, not as an accuracy claim, consistent with the standing evaluation-plan
+    limitation.
+
+**This recommendation is not launched. Awaiting explicit authorization before submitting any
+Condition D job.**

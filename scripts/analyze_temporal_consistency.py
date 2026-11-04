@@ -18,6 +18,17 @@ save_optimized_data, not assumed):
   mano_transforms.npz -> 'rotation_matrices': shape (N, 3, 3), 'translations': shape (N, 3)
   optimized_mano_joints.npz -> 'mano_joints': shape (N, 1, J, 3)
   optimized_mano_verts.npz  -> 'mano_verts':  shape (N, 1, V, 3)
+
+CORRECTION (source-level investigation, see plan.md "SOURCE-LEVEL DIAGNOSTIC INVESTIGATION"):
+under the released config's fix_hand_rotation_to_wilor=True, mano_transforms.npz's
+'rotation_matrices' is hard-set to torch.eye(3) for every frame at export time
+(trainer.py save_optimized_data: "The saved transform is relative to the original
+WiLoR orientation. Identity preserves it without conversion."). An exact-zero hand
+rotation delta from analyze_hand() below is therefore an EXPECTED, by-design artifact
+of this config, not evidence about actual hand motion, and not an analysis bug. The
+true per-frame WiLoR rotation (which does vary) lives in mano_global_orient.npz
+instead, as unmodified input data identical across conditions that don't change
+fix_hand_rotation_to_wilor.
 """
 import argparse
 import ast
@@ -184,6 +195,10 @@ def analyze_object_poses(object_poses_in_cam):
 
 
 def analyze_hand(rotation_matrices, translations):
+    # Under fix_hand_rotation_to_wilor=True (the released config), rotation_matrices
+    # is guaranteed eye(3) for every frame by trainer.py's export code - see the
+    # module docstring CORRECTION above. A zero rotation delta here is expected,
+    # not a bug, and carries no information about actual hand motion.
     n = len(rotation_matrices)
     rot_deltas = [None]
     trans_deltas = [None]
