@@ -1096,3 +1096,109 @@ confirming the new logging introduced zero divergence from the pre-existing beha
   obj-iters, 1:59:23), marginal per-iteration object cost ~= (1:59:23-1:12:33)/400/40 frames ~=
   0.176 s/iter. D adds 800 more iters/frame over C: ~800*0.176*40 ~= 94 min over C's time ->
   estimated total **~3h30m**, comfortably inside the 8-hour walltime requested.
+
+## CONDITION D — RESULTS AND B-SMOOTHNESS REVISIT (2026-11-04, continued)
+
+### Job outcome
+Job 73371 (`exp_D`), partition `short`, completed successfully: exit 0:0, elapsed 03:29:30
+(estimate was ~3h30m — matched closely). STATUS=COMPLETE. Output verified complete at
+`results/D_control_iters1600/aligned/` (same 16-file set as A/B/C, 40 frames: 2 backward + 38
+forward, matching the approved window's expected keyframe count exactly as in A/B/C).
+
+### Convergence status distribution — object optimizer (40 frames each)
+| Condition | budget (iters) | budget_exhausted | stalled_at_budget |
+|---|---|---|---|
+| A | 400  | 28/40 (70%) | 12/40 (30%) |
+| C | 800  | 32/40 (80%) |  8/40 (20%) |
+| D | 1600 | 38/40 (95%) |  2/40 (5%)  |
+
+This is the OPPOSITE of the "more iterations resolves budget exhaustion" hypothesis motivating
+D. Root cause, established from D's new per-iteration diagnostic log
+(`logs/experiments/D_control_iters1600/diagnostics.jsonl`, 71,280 records) plus source:
+
+1. **The object optimizer's learning rate never decays**, in A/B/C/D alike. `object_scheduler_type`
+   (a field distinct from the hand optimizer's `online_scheduler_type`) defaults to `"constant"`
+   in `optimization/config/config.py:329`, and the released `configs/ho3d.json` never overrides
+   it. `create_scheduler(..., scheduler_type='constant')` returns
+   `ConstantLR(optimizer, factor=1.0, ...)` — confirmed empirically: D's diagnostics show
+   `learning_rates == [0.002, 0.001]` at every logged checkpoint from iteration 0 through the
+   final iteration 1599, for every frame checked.
+2. **Object loss plateaus within the first ~100–300 iterations** regardless of total budget:
+   across all 39 complete object frames in D, 36/39 show <2% loss change between iteration 300
+   and the final iteration 1599 (checked explicitly, not inferred).
+3. **Step size oscillates noisily around the convergence threshold** (`online_converge_thresh =
+   1e-4`) for the remainder of the budget, without a decaying trend — e.g. frame 50's step_norm
+   cycles between ~3e-5 and ~4e-4 for 1300+ iterations; aggregated over the last 200 iterations
+   alone, per-frame threshold-crossing counts range from 0 to 45.
+4. **Conclusion**: `budget_exhausted` vs. `stalled_at_budget` is substantially determined by
+   which side of this flat, noisy oscillation the terminal iteration happens to land on — not by
+   whether the optimizer has genuine remaining progress to make. A longer budget simply samples
+   more iterations from this noisy process, so it has more chances to land above threshold at
+   termination purely by chance. This quantitatively explains the monotonic 70%→80%→95% trend.
+
+### Temporal-consistency metrics (final saved outputs, actual `analyze_temporal_consistency.py`
+run on A/C/D's real data — see "A/B/C path correction" note below)
+| Condition | object_rotation_delta_rad (median) | object_translation_delta (median) |
+|---|---|---|
+| A | 0.17868 | 0.013007 |
+| C | 0.17998 | 0.013039 |
+| D | 0.17978 | 0.013039 |
+
+Differences across A/C/D are ~0.1–0.7% of the median value — noise-level, not material. Hand
+translation/rotation deltas are identical across A/C/D to displayed precision (expected: object
+iteration budget does not affect the hand optimizer). **This directly confirms, from the actual
+saved outputs (not just per-iteration diagnostics), that the 4x increase in object iteration
+budget (400→1600) produced no detectable change in the final reconstructed object or hand
+trajectories.**
+
+### Explicit non-claims (per authorization)
+This is a finding about convergence-status mechanics and iteration-budget sufficiency only. It
+does **not** make, and should not be read as making, any claim about geometric accuracy against
+ground truth. The *increase* in budget_exhausted counts with more iterations is not evidence of
+worse reconstruction, any more than a decrease would have been evidence of better reconstruction
+— the temporal-consistency numbers above are what settle the "did anything actually change"
+question, and they say no.
+
+### A/B/C path correction (process note, not a data-integrity issue)
+While preparing this comparison, `results/A_released/`, `results/B_smoothness/`, and
+`results/C_control_iters800/` were found to contain only `effective_config.json`,
+`run_manifest.json`, `STATUS` — no `aligned/` output. This is NOT data loss: it is the
+previously-documented `Config.get_result_dir()` auto-path bug (see the "A/B/C output isolation"
+findings earlier in this file) — A/B/C's real outputs were saved, before the fix, to
+AGILE's own auto-generated paths:
+  - A → `results/MC1/1104_011226_mask5.0_feature10.0_typelocal_lastframe/aligned`
+  - B → `results/MC1/1104_011508_mask5.0_smoothness0.0002_feature10.0_typelocal_lastframe/aligned`
+  - C → `results/MC1/1104_021134_mask5.0_feature10.0_typelocal_lastframe/aligned`
+D (run after the `build_effective_config()` fix) saved correctly to its intended
+`results/D_control_iters1600/aligned`. All data for all four conditions is present and intact;
+this note exists so a future reader does not mistake the isolated `results/{A,B,C}_*/` directories
+for the complete outputs.
+
+### B smoothness-loss magnitude — final answer (authorization item 5)
+Re-verified via disambiguated log parsing (`[Object]`-prefixed lines only, vs. the earlier
+non-disambiguated grep that conflated them with the unrelated, always-on `[Hand]`
+`hand_smoothness_loss` term): **all 31,200** `[Object]` smoothness_loss print occurrences in B's
+log read exactly `0.0000` at 4-decimal precision, with zero exceptions. No higher-precision
+record exists anywhere in B's artifacts: no alternate print statement in
+`object_optimizer.py`/`losses/__init__.py` emits the raw/unweighted value, no TensorBoard writer
+was active (no `tfevents` files), and `results/B_smoothness/` holds no per-iteration history
+artifact. What the evidence *does* support, as a bound rather than a point estimate: a value that
+rounds to 0.0000 at every one of 31,200 samples implies the weighted contribution stayed below
+~5e-5 throughout the entire run — two to three orders of magnitude below the co-active
+`feature_loss` (~5.8) and `alpha_loss` (~0.4) at the same iterations. This is consistent with
+(but does not rigorously prove) negligible practical influence; Adam's per-parameter adaptive
+step-size normalization means a persistently-directional but tiny gradient could in principle
+still exert some influence that a raw-magnitude argument would not capture. No new experiment was
+run to resolve this further, per instruction.
+
+### Next scientifically justified direction (not run, not authorized — offered per item 6)
+Given the object optimizer's LR is flat by the released config's own `object_scheduler_type` and
+loss plateaus within ~300 iterations regardless of total budget, further increases in
+`object_max_iter_per_frame` alone are not a promising direction — this experiment (D) has now
+demonstrated that. The data suggest the more productive lever, if iteration-budget-related
+experiments are to continue, would be testing an actual *decaying* `object_scheduler_type` (e.g.
+`"sequential"`, already implemented and already used by the hand optimizer, but never applied to
+the object optimizer in the released config) — not raw iteration count — since a flat LR acting
+on a noisy, plateaued loss is the direct, source-grounded explanation for the oscillating
+step-size behavior observed here. This is a new, falsifiable hypothesis, offered as a candidate
+next direction only; no experiment has been run or authorized beyond A/B/C/D.
