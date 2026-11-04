@@ -630,3 +630,134 @@ not yet rigorously compared - see next step).
   document and use the actual auto-generated paths going forward. Flagged to user,
   not decided unilaterally - results/ is gitignored/not version-controlled, so any
   move would need explicit care.
+
+## 2026-11-04 (cont.) - User decision on output locations: leave in place (option 2)
+
+User explicitly chose NOT to move/rename/copy/reorganize any existing A/B/C output.
+All data stays exactly where AGILE actually wrote it. No files moved, renamed, or
+deleted at any point in this project.
+
+### Consolidated record: wrapper manifest dirs vs AGILE's actual output dirs
+Two genuinely distinct things exist per condition, serving different purposes:
+
+1. **Wrapper manifest directories** (results/{A_released,B_smoothness,C_control_iters800}/)
+   - Created and written by scripts/run_experiment.py itself.
+   - Contain ONLY: effective_config.json, run_manifest.json (git commit/dirty state,
+     environment package versions, dataset identity + integrity-verification
+     reference). These are small, our own bookkeeping files - NOT AGILE's
+     optimization output.
+
+2. **AGILE's actual output directories** (results/MC1/<timestamp>_<loss_info>[_<mode_info>]/)
+   - Created and written by AGILE's own Config.get_result_dir() auto-generation
+     (root cause below), containing the REAL optimization results: aligned/
+     (object_poses.npz, mano_transforms.npz, optimized_mano_{joints,verts}.npz,
+     object_mesh.obj, export_metadata.json, textures), plus
+     {hand,object}_optimization_videos/, pcd_vis/, videos/, contact_pcd.ply.
+   - Exact paths, verified on disk:
+     - A: results/MC1/1104_011226_mask5.0_feature10.0_typelocal_lastframe/
+     - B: results/MC1/1104_011508_mask5.0_smoothness0.0002_feature10.0_typelocal_lastframe/
+     - C: results/MC1/1104_021134_mask5.0_feature10.0_typelocal_lastframe/ (pending
+       final confirmation once job 73232 completes)
+
+### Root cause (verified against AGILE source, repeated here for a single authoritative record)
+scripts/run_experiment.py's load_scene_overrides() never set Config.result_dir in
+the dict passed to Config(**effective) - only an internal result_dir(condition)
+helper existed, used solely for where OUR wrapper's own manifest files were
+written. With Config.result_dir=None, AGILE's Config.get_result_dir()
+(optimization/config/config.py) auto-generates results/{scene}/{timestamp}_
+{loss_info}[_{mode_info}], where loss_info/mode_info are built from which loss
+flags are enabled (mask, depth, normal, contact, smoothness, feature/type,
+lastframe, handscale) - object_max_iter_per_frame (condition C's delta) is NOT
+one of the incorporated fields, so C's directory is distinguished from A's by
+timestamp alone.
+
+### No output collision occurred - verified on disk, not assumed
+Each condition's auto-generated directory name is distinct (different timestamps;
+B additionally differs via its smoothness-weight component). Confirmed via direct
+filesystem listing (find ... -type d) before any analysis was attempted - A's and
+B's directories are separate, non-overlapping, each containing a complete,
+independent set of output files.
+
+### Fix commit
+3f8720e5a096ba3c0300d0f0fd4a3206198a926c (pushed to origin/main) - 
+load_scene_overrides() no longer sets result_dir; build_effective_config() now
+sets reference["result_dir"] = str(result_dir(condition)) before effective is
+copied from reference (so it is identical in both, never appears in the
+single-field-diff check). 
+
+### Re-verification that the fix is real (item 4 of the user's latest instructions)
+Re-ran --check-only for conditions A and B after the fix (no GPU job consumed):
+diffs still exactly correct ([], [object_smoothness_loss]); directly inspected the
+written effective_config.json and confirmed result_dir now resolves to
+/scratch/users/anirban/tamaghnam/HOI/results/A_released (and equivalently for
+other conditions) - CONFIRMED the corrected wrapper explicitly sets
+Config.result_dir for any future experiment launched through it. This fix was
+NOT applied retroactively to the already-running condition C (its Config object
+was constructed before the fix existed; a running job was not touched).
+
+## 2026-11-04 (cont.) - Condition C COMPLETED; full A/B/C temporal-consistency analysis
+
+### Condition C (job 73232): COMPLETED, exit 0:0, elapsed 01:59:23 (7138s) - notably
+longer than A/B, consistent with double the object iteration budget.
+"[Bidirectional] Saving combined result: 2 backward + 38 forward = 40 frames",
+"Optimized frame range: 0 to 39" - identical frame structure to A and B. Final
+object scale 0.9288 (reported as diagnostic only, see comparison below).
+
+### Output completeness verified (item 2) - all three conditions
+All three aligned/ directories (actual AGILE output paths, see prior entries)
+contain the identical 16-item file set: Bake_Mat.png, camera_data.npz,
+export_metadata.json, mano_betas.npz, mano_faces.npz, mano_global_orient.npz,
+mano_hand_pose.npz, mano_transforms.npz, material_0.png, material.mtl,
+object_assets/, object_assets.json, object_mesh.obj, object_poses.npz,
+optimized_mano_joints.npz, optimized_mano_verts.npz. Frame correspondence
+confirmed identical across A/B/C: all three report "frame range 0 to 39 (total:
+40 frames)" with the same 2-backward+38-forward composition.
+
+### Temporal-consistency analysis (scripts/analyze_temporal_consistency.py, run
+against the REAL aligned/ directories, not the wrapper manifest dirs)
+Object rotation/translation deltas (median, IQR, max over 39 frame-to-frame
+transitions per condition), zero NaN in all cases:
+| Condition | obj rot median (rad) | obj rot IQR | obj trans median | obj trans IQR |
+|---|---|---|---|---|
+| A | 0.17868 | 0.11517 | 0.013007 | 0.013062 |
+| B | 0.18042 | 0.11196 | 0.013080 | 0.013167 |
+| C | 0.17998 | 0.11080 | 0.013039 | 0.012930 |
+
+OBSERVATION: object rotation/translation deltas are nearly identical across all
+three conditions - B's added smoothness loss did NOT produce a measurably lower
+frame-to-frame delta relative to A at this level of precision. This is a real,
+reportable finding, not a null result being hidden.
+
+Hand rotation delta: EXACTLY 0.0 (median, IQR, max all 0.0, 39/39 valid, 0 NaN) in
+ALL THREE conditions. Verified numerically, not inferred - every per-frame
+rotation_matrices entry is identical across the full 40-frame sequence in every
+condition. Consistent with fix_hand_rotation_to_wilor=True, though the exact
+mechanism (whether this field represents absolute orientation vs. a reference-
+relative transform) was not further verified against source - flagged as an open
+question, not asserted as fully explained.
+
+### Iteration-budget convergence (item 9) - comprehensive, not just the smoke-test sample
+Extracted ALL [Convergence] log records (80 per condition = 40 frames x 2
+components; 240 total across A/B/C). Result: 100% of all 240 component-level
+optimizations report either "stalled_at_budget" or "budget_exhausted" - ZERO
+early-stopping convergence anywhere, in any condition, for either hand or object.
+This is the same pattern observed in the smoke test, now confirmed universal
+across the full approved window, not an artifact of the smoke test's tiny window.
+
+Status tally by condition/component:
+- A: hand 40/40 stalled_at_budget; object 27 budget_exhausted@400 + 12
+  stalled_at_budget@400 + 1 budget_exhausted@800 (first frame, 
+  object_max_iter_first_frame=800 per released config).
+- B: hand 40/40 stalled_at_budget; object 22 budget_exhausted@400 + 17
+  stalled_at_budget@400 + 1 budget_exhausted@800 (first frame).
+- C: hand 40/40 stalled_at_budget; object 32 budget_exhausted@800 + 8
+  stalled_at_budget@800 (all 40 at the condition's 800-iteration delta).
+
+Notable, flagged without over-interpretation: C's object optimizations show a
+HIGHER proportion reported as "budget_exhausted" (32/40=80%) than A's (28/40=70%)
+despite double the iteration budget. The precise semantic distinction between
+"budget_exhausted" and "stalled_at_budget" was not verified against AGILE's
+convergence-checking source code in this pass - this comparison is reported as an
+observed pattern, not a conclusion about whether C's extra iterations helped or
+hurt convergence, since the status labels' exact criteria are not fully
+understood yet.
