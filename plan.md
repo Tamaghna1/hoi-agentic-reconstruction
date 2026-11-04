@@ -1202,3 +1202,151 @@ the object optimizer in the released config) — not raw iteration count — sin
 on a noisy, plateaued loss is the direct, source-grounded explanation for the oscillating
 step-size behavior observed here. This is a new, falsifiable hypothesis, offered as a candidate
 next direction only; no experiment has been run or authorized beyond A/B/C/D.
+
+## CONDITION E — DECAYING OBJECT-OPTIMIZER LR SCHEDULE (2026-11-04/05)
+
+### Scheduler implementation (inspected fresh from source before any config change, per authorization item 1)
+Confirmed three **distinct** scheduler-type config fields exist in `optimization/config/config.py`,
+not one: `object_scheduler_type` (read explicitly by `object_optimizer.py` for all its
+optimizers — rot/trans/scale), `hand_scheduler_type` (read by `hand_optimizer.py`'s main
+trans/rot optimizers), and `online_scheduler_type` (fallback inside `Runner.create_scheduler()`,
+used only for the hand's *optional* scale/intrinsics/pose schedulers). All three default
+differently (`"constant"`, `"sequential"`, `"sequential"` respectively); the released
+`ho3d.json` never overrides the first two, i.e. both sit at their dataclass defaults.
+`create_scheduler()` dispatches on the type string to a real torch scheduler
+(`ConstantLR`/`SequentialLR`/`LinearLR`/`ExponentialLR`, plus an unsupported `'sequential2'`
+`LambdaLR` variant not in either field's `Literal` type) and raises `NotImplementedError` for
+anything else — so only genuinely implemented options were considered. Confirmed
+`scheduler.step()` fires unconditionally once per iteration, in lockstep with `optimizer.step()`,
+identically in `object_optimizer.py` and `hand_optimizer.py` — there is no secondary interval or
+condition gating it.
+
+**Selected: `object_scheduler_type = "linear"`** — `LinearLR(start_factor=1.0, end_factor=0.1,
+total_iters=train_max_iter)`. Chosen over `"sequential"` (multi-phase, already used by hand) and
+`"exponential"` (requires deriving a gamma) as the simplest option that still produces gradual,
+monotonic decay to a materially smaller terminal LR, with no additional config fields required.
+
+### Condition E definition
+Single-field delta from A: `{"object_scheduler_type": "linear"}`. Everything else (MC1 window
+10–200, `object_max_iter_per_frame=400`, all loss weights, hand optimizer config, MANO/DINOv3
+assets, seed) identical to A. Verified via `assert_single_field_diff()` and a manual
+`effective_config.json` diff against A's: the only changed key is `object_scheduler_type`
+(`'constant'` → `'linear'`).
+
+### Scheduler smoke test (job 73447, isolated at `results/smoke_test_scheduler/`)
+COMPLETED, exit 0:0, elapsed 00:09:50. Explicitly checked LR *decay*, not just scheduler
+construction: for every `(frame_id, 'object')` optimizer in the 3-frame smoke run, LR ratio
+(last iteration / first iteration) was 0.1001–0.1002 (expected ~0.1), and decay was confirmed
+monotonic (first ≥ mid ≥ last) for every optimizer. Diagnostics mechanism cross-checked:
+`runner.convergence_events` (6, pre-existing mechanism) exactly matched new termination
+diagnostic records (6). PASSED before the real job was submitted.
+
+### Pre-flight checks (all passed, authorization item 4)
+Single-field diff confirmed against A; `results/E_linear_schedule/` confirmed isolated/empty of
+real output before submission; scratch usage trivial (2.6G total project); `sbatch --test-only`
+queue forecast (~12h wait) was a scheduling matter only, not a resource problem.
+
+### Job outcome
+Job 73449 (`exp_E`), completed successfully: exit 0:0, elapsed 01:11:20 (started
+2026-11-04T21:24:10, ended 2026-11-04T22:35:30). STATUS=COMPLETE. Output verified complete at
+`results/E_linear_schedule/aligned/` — same 16-file set as A/B/C/D, 40 frames (2 backward + 38
+forward), matching the approved window's expected keyframe count exactly as in A/B/C/D.
+
+### LR trajectory — genuinely decays (authorization item 4/5, question 1)
+Pulled the **real** run's diagnostics log (`logs/experiments/E_linear_schedule/diagnostics.jsonl`,
+24,480 records), not just the smoke test. All 40 distinct object frame-runs show monotonic LR
+decay from the first to the last logged iteration, with ratio 0.1001–0.1003 (median 0.1002),
+matching the `linear` scheduler's expected `end_factor=0.1` exactly. (Frame 10, the
+backward/forward seed frame, is optimized twice — 800 total records — and each of its two
+400-iteration passes independently shows the same ~0.1x decay, confirming the scheduler
+re-initializes correctly on each call rather than carrying state across passes.) **Answer to
+question 1: yes, the LR decays exactly as the selected scheduler specifies.**
+
+### Loss trajectory — still plateaus early (question 2)
+Computed percent change in total object loss from iteration 300 to the final iteration, across
+all 40 frame-runs: median 0.48%, mean 0.74%, max 3.97%; 37/40 frame-runs show <2% change. This
+is essentially the same plateau timing documented for D under the flat (constant) LR. **Answer
+to question 2: no — the decaying schedule does not cause loss to continue improving past the
+~100–300 iteration mark; the plateau is a property of the loss landscape/budget, not the LR
+schedule.**
+
+### Gradient/step-size behavior (question 3) and convergence-status proportions (question 4)
+| Condition | object_scheduler_type | budget (iters) | budget_exhausted | stalled_at_budget |
+|---|---|---|---|---|
+| A | constant | 400  | 28/40 (70%) | 12/40 (30%) |
+| C | constant | 800  | 32/40 (80%) |  8/40 (20%) |
+| D | constant | 1600 | 38/40 (95%) |  2/40 (5%)  |
+| E | **linear** | 400 | **1/40 (2.5%)** | **39/40 (97.5%)** |
+
+Step magnitude settles far more smoothly under the decaying schedule: mean `step_norm` across
+frames falls from 0.00222 (first 100 iterations) to 9.14e-5 (last 100 iterations) in E — a ~24x
+reduction — versus D's constant-LR 0.0024 → 1.56e-4 over the equivalent first-400-iteration
+window (~15x, and per D's own diagnostics, this decrease does not continue smoothly but
+oscillates for the remaining 1200 iterations). At the exact terminal iteration, E's `step_norm`
+median across all 40 frame-runs is 2.57e-5 (only 1/40 above the `online_converge_thresh=1e-4`
+threshold), versus D's terminal-iteration median of 1.84e-4 (straddling the threshold, which is
+exactly why D's 95% `budget_exhausted` rate is so high). **Answer to question 3: yes, gradients
+and step magnitudes settle far more consistently (monotonically, not just on average) under the
+decaying schedule than under the flat one.**
+
+**Important caveat on question 4's result, required by the authorization's "do not assume a
+scheduler is effective merely because it decays" and "distinguish convergence behavior from
+reconstruction accuracy" instructions:** the near-total flip from `budget_exhausted` to
+`stalled_at_budget` is a **mechanical, expected consequence of imposing a 10x LR decay on the
+step-size threshold test**, not evidence that the optimizer found a better optimum or that more
+genuine progress occurred. Because `step_norm` scales with `learning_rate × gradient`, forcing
+the LR down to 0.1x by the final iteration will push `step_norm` under almost any fixed threshold
+near the end of the run **regardless of whether the underlying gradient has actually stopped
+changing** — this is precisely the caveat already present in the diagnostic code's own
+`stalled_at_budget` reason string ("may reflect LR-schedule decay rather than a true plateau").
+The loss-plateau result above (question 2) is the more reliable signal here, and it shows no
+material change from the flat-LR conditions.
+
+### Final trajectory and temporal consistency (questions 5 and 6, real saved outputs — `analyze_temporal_consistency.py`)
+| Condition | object_rotation_delta_rad (median) | object_translation_delta (median) | hand deltas |
+|---|---|---|---|
+| A | 0.17868 | 0.013007 | baseline |
+| E | 0.18025 | 0.013105 | identical to A |
+
+Differences: object rotation +0.88%, object translation +0.75% — noise-level, consistent with
+the ~0.1–0.9% spread already seen across A/C/D. Hand rotation/translation deltas are identical
+to displayed precision (expected: this condition only changes the object optimizer's scheduler).
+**Answer to question 5: no material change in the final object trajectory. Answer to question 6:
+temporal consistency is effectively unchanged, not improved or worsened.**
+
+### Does the schedule produce meaningful benefit within the same budget? (question 7)
+No. The decaying schedule is correctly implemented, genuinely decays (question 1), and produces
+much smoother, more monotonic step-size behavior (question 3) — but it does not change when the
+loss plateaus (question 2) or what the final reconstructed trajectory looks like (questions 5–6).
+The large shift in `budget_exhausted`/`stalled_at_budget` proportions (question 4) is better
+understood as the convergence-status *heuristic* becoming a direct readout of the imposed LR
+curve, rather than as a signal of improved optimization. Within a 400-iteration budget on this
+scene/window, switching the object optimizer from a constant to a linearly-decaying LR schedule
+has no detected effect on the reconstruction, only on the internal diagnostics' interpretation of
+convergence.
+
+### Explicit non-claims (per authorization)
+This is a finding about optimizer/scheduler convergence dynamics and the convergence-status
+heuristic's sensitivity to LR shape — not a claim about geometric accuracy against ground truth.
+No ground-truth evaluation was performed for E, consistent with none having been performed for
+A/B/C/D.
+
+### Limitations
+Single scene/window (MC1, frames 10–200); one decaying schedule (`linear`) out of three valid
+options (`sequential`, `exponential` untested); one iteration budget (400, matching A) — a
+decaying schedule combined with a *different* budget was not tested, since the authorization
+scoped E to A's exact 400-iteration budget. Diagnostics give per-iteration optimizer internals
+only, not pixel/mesh-level accuracy.
+
+### Recommended next direction (not run, not authorized — offered per item 6)
+Two independent levers have now been tested against the same null result: raising the object
+iteration budget 4x (C/D) and imposing a 10x-decaying LR schedule on the existing budget (E).
+Neither changed the final reconstructed trajectory beyond noise level, and the loss plateau at
+~100–300 iterations is invariant to both. This converges on a different conclusion than either
+experiment alone suggested: the bottleneck is unlikely to be the object optimizer's convergence
+procedure at all. A more promising next step would be examining what the loss is actually
+optimizing — e.g. whether `feature_loss`/`alpha_loss`'s local optimum at ~iteration 300 reflects
+a genuine geometric optimum or a limitation of the loss formulation/feature representation
+itself — or evaluating reconstruction quality against ground-truth object poses directly, which
+no experiment in this series (A–E) has yet done. This is a new candidate direction only; no
+experiment has been run or authorized beyond A/B/C/D/E.
