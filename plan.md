@@ -1350,3 +1350,104 @@ a genuine geometric optimum or a limitation of the loss formulation/feature repr
 itself — or evaluating reconstruction quality against ground-truth object poses directly, which
 no experiment in this series (A–E) has yet done. This is a new candidate direction only; no
 experiment has been run or authorized beyond A/B/C/D/E.
+
+## GROUND-TRUTH EVALUATION AUDIT — BLOCKED (2026-11-05)
+
+Per authorization, this was a READ-ONLY audit of GT availability, metric validity, and frame
+correspondence for A–E, run before any evaluation. No Slurm job was submitted, no files were
+modified, nothing was downloaded. **Conclusion: the gate fails — no genuine official ground
+truth exists on this cluster for MC1. Evaluation was NOT run, per the authorization's explicit
+"stop before running the evaluation" instruction.**
+
+### 1. GT availability — none found; everything present is a model prediction/initialization, not GT
+| Asset | Found locally? | What it actually is | Path |
+|---|---|---|---|
+| Object 6D pose | **No** | `object_pose/ob_in_cam/*.txt` — **FoundationPose's own predicted pose** (its own naming convention, `ob_in_cam`), used only as optimizer initialization per `optimization/README.md` ("WiLoR, MoGe, FoundationPose ... object pose initialization") | `data/HO3D/preprocessed/train/MC1/object_pose/` |
+| Object mesh | **No** | `object_pose/{original_mesh.obj,scaled_mesh.obj}` — a reconstructed/scanned mesh used for FoundationPose tracking, not an official YCB CAD model in GT-aligned coordinates | same dir |
+| Hand pose/shape | **No** | `wilor/*.npz` — **WiLoR's predicted** MANO params, used only as a rotation/translation initialization (`fix_hand_rotation_to_wilor`, `config.py:241`) | `data/HO3D/preprocessed/train/MC1/wilor/` |
+| Camera intrinsics | Present, but only the camera actually used for reconstruction; not independently cross-checked against an official calibration file (none exists locally to check against) | `moge/cam_K.txt`, also duplicated into every `camera_data.npz["intrinsic"]` | both present |
+| Frame IDs | **Yes** — see item 3 below | `camera_data.npz["prediction_frame_ids"]` | every `aligned/` dir |
+
+No `meta/*.pkl` and no `models/<obj>/textured_simple.obj` exist anywhere on this filesystem
+(`find data/ -iname "*.pkl"` returns nothing under `HO3D/`; the only `.pkl` anywhere is the
+unrelated `assets/mano/MANO_RIGHT.pkl` model file). This was verified by searching, not assumed
+absent.
+
+**Decisive confirmation from AGILE's own source and docs — the repo itself tells us GT is
+intentionally excluded from what we have:**
+- `optimization/utils/dataset_utils.py:27`: `HO3D_ROOT = os.environ.get('HO3D_ROOT',
+  'datasets/HO3D/raw')` — a dedicated GT loader class (`Ho3dReader.get_gt_pose`/`get_mano_data`/
+  `get_gt_mesh`) exists in the codebase and expects `{HO3D_ROOT}/<seq>/meta/*.pkl` and
+  `{HO3D_ROOT}/models/<obj>/textured_simple.obj` — a **separate dataset directory that was never
+  downloaded** on this cluster. `HO3D_ROOT` is currently unset; no such directory exists under
+  this user's scratch or home.
+- `docs/installation.md:98`: *"For evaluation, obtain the original HO3D annotations and object
+  models ... Ground truth is not needed for optimization or visualization."*
+- `docs/ho3d-results.md`: *"MANO model files, external network weights and evaluation ground
+  truth are not included."*
+
+### 2. Metric validity — formulas exist in-repo, but literally nothing is computable without GT
+AGILE ships a real, already-implemented evaluation protocol at `optimization/evaluation/protocols.py`
+(`METRIC_PROTOCOLS`, versioned `evaluation-v2-gt-cv-robust-icp`):
+- `cd_icp` (cm²) — object Sim(3) alignment via PCA+FPFH+ICP, bidirectional nearest-neighbor
+  Chamfer distance.
+- `cd_right` (cm²) — HOLD-style: object pose minus hand-wrist pose, **no fitted rotation/scale**
+  — the one candidate metric that would not risk trivially hiding translation error via
+  over-permissive alignment.
+- `cd_interaction_hand_sim3_per_frame` (cm²) — per-frame Sim(3) fit to 21 GT hand joints, then
+  applied to the object.
+- `mpjpe_ra_r` (mm) — wrist-translation-only alignment, canonical 21 joints.
+- `mpjpe_right_scaled` (mm) — wrist-translation + one global least-squares scale, explicitly
+  marked "auxiliary" in the code (i.e. the authors themselves flag it as the least trustworthy
+  of the set).
+
+`protocols.validate_inputs`/`valid_mask`/`check_frame_ids` **hard-require** a genuine binary
+`is_valid` GT mask and matching `frame_ids` between prediction and GT arrays — there is no
+fallback or degraded mode. This is not a judgment call: the code itself will refuse to execute
+without real GT frame-validity data, which we do not have. **Zero metrics are currently
+computable**, not because of ambiguity in method but because the required GT input tensors do
+not exist.
+
+### 3. Frame correspondence — solved, high confidence, independently cross-checked
+Every `aligned/camera_data.npz` contains an authoritative `prediction_frame_ids` int64 array,
+shape `(40,)`, documented in that condition's `export_metadata.json` as
+`"frame_ids_source": "saved-prediction-frame-ids"` — not inferred from loader logs. Pulled and
+compared for two independently-run conditions (A and E):
+```
+prediction_frame_ids == [0, 5, 10, 15, 20, ..., 190, 195]   (identical for A and E)
+```
+Mapping: **output index `i` → original video frame `5*i`**. Output index 2 → original frame 10,
+which equals `WINDOW_START`/the scene's `contact_frame` — consistent with the known approved
+window. Because this is identical across two separately-run jobs, it is a deterministic property
+of the sampling code, not something that could have drifted per-run. Camera coordinate
+convention (OpenCV, metres) is also consistent across all saved `camera_data.npz` files.
+
+### Gate decision: BLOCKED — evaluation not run
+Frame correspondence and coordinate conventions are fully verified and evaluation-ready. The
+sole blocker is the GT asset itself: official HO3D annotations (`meta/*.pkl` with
+`objTrans`/`objRot`/`objCorners3D`/`handPose`/`handTrans`/`handBeta`/`handJoints3D`) and object
+CAD models were never downloaded to this cluster — AGILE's own installation docs confirm this
+was an intentional omission for the optimization-only workflow we've been running. What exists
+locally under `object_pose/` and `wilor/` are FoundationPose's and WiLoR's own *predictions*,
+used only as optimizer initialization; treating either as GT would be circular (comparing AGILE's
+optimized output against the same model's own unoptimized guess) and was explicitly ruled out by
+the authorization's "never treat predictions as ground truth" instruction.
+
+**What acquiring GT would require**: the official HO-3D_v3 release. Public mirrors list the full
+archive at roughly 32–67 GB (varies by mirror/version), academic-research-only license, hosted at
+the TU Graz project page (per the GitHub repo `shreyashampali/ho3d`) — this is far over the
+~1GB threshold the user set for unprompted downloads, and whether a smaller annotations-only
+subset (just `meta/*.pkl` for the MC1 sequence, no RGB/depth/already-have-those) is separately
+obtainable has not been verified. **No download has been attempted or will be attempted without
+explicit user confirmation of source and size.**
+
+### Recommended next step (not run, not authorized — offered per the authorization's final item)
+Three options, none executed:
+1. Obtain official HO3D GT (likely the only way to get a real geometric-accuracy number) — needs
+   the user to confirm an acceptable size/subset and source before any download is attempted.
+2. Proceed with the loss-landscape investigation (examining why `feature_loss`/`alpha_loss`
+   plateau at ~iteration 300, per Condition E's recommended direction) — this does not require
+   GT and can proceed on existing data.
+3. Identify a different dataset/benchmark already available locally (if any) with usable GT,
+   as a substitute for MC1-specific evaluation.
+No experiment or evaluation has been run beyond what was already authorized (A–E, this audit).
