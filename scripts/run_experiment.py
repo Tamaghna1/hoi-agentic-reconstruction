@@ -45,6 +45,7 @@ CONDITIONS = {
     "A": {},                                       # released baseline, no delta
     "B": {"object_smoothness_loss": True},          # + vertex smoothness only
     "C": {"object_max_iter_per_frame": 800},        # + compute-matched control only
+    "D": {"object_max_iter_per_frame": 1600},       # + iteration-budget control only (vs A)
 }
 
 STATUS_PENDING = "PENDING"
@@ -122,12 +123,12 @@ def build_effective_config(condition):
 
 
 def result_dir(condition):
-    names = {"A": "A_released", "B": "B_smoothness", "C": "C_control_iters800"}
+    names = {"A": "A_released", "B": "B_smoothness", "C": "C_control_iters800", "D": "D_control_iters1600"}
     return RESULTS_ROOT / names[condition]
 
 
 def log_dir(condition):
-    names = {"A": "A_released", "B": "B_smoothness", "C": "C_control_iters800"}
+    names = {"A": "A_released", "B": "B_smoothness", "C": "C_control_iters800", "D": "D_control_iters1600"}
     d = LOGS_ROOT / "experiments" / names[condition]
     return d
 
@@ -239,7 +240,7 @@ def write_status(outdir, status):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--condition", choices=["A", "B", "C"], required=True)
+    ap.add_argument("--condition", choices=["A", "B", "C", "D"], required=True)
     ap.add_argument("--check-only", action="store_true",
                      help="Validate config/prerequisites and write manifests; do not run AGILE.")
     ap.add_argument("--resume", action="store_true",

@@ -1022,3 +1022,77 @@ logged.
 
 **This recommendation is not launched. Awaiting explicit authorization before submitting any
 Condition D job.**
+
+## CONDITION D — AUTHORIZED, IN PROGRESS (2026-11-04)
+
+User reviewed the source-level investigation and authorized Condition D: released A
+configuration with exactly `object_max_iter_per_frame: 400 -> 1600` changed, plus
+observational-only per-iteration diagnostic logging added beforehand, tested in isolation
+first. B and C were not touched. A/B/C outputs were not modified.
+
+### Diagnostic logging implementation
+
+Added `repo/optimization/optim/diagnostics.py` (new file): a `log_record(dict)` function that
+appends one JSON line to the path named by the `AGILE_DIAGNOSTIC_LOG` env var, or is a complete
+no-op if that var is unset (so A/B/C's exact prior behavior is reproduced with zero code-path
+difference when it's unset). Patched `object_optimizer.py` and `hand_optimizer.py` to call
+`log_record` once per iteration (loss terms, gradient_inf, step_norm, pose_change, learning
+rates, convergence_status) and once per frame/component at termination (status + a static,
+human-readable `reason` string per status, plus the existing `event` dict fields). The only
+change to pre-existing lines was hoisting one already-made call,
+`optimizer_step_norm(optimizers, step_before)`, into a local variable (`_diag_step_norm`) to
+avoid computing it twice — the value, call site, and inputs are unchanged, and it still feeds
+`convergence.observe()` identically. No gradient, optimizer, scheduler, loss, or convergence
+computation was altered. Full diff reviewed before committing — 46 insertions across both
+files, zero deletions of existing logic lines. Committed **locally inside `repo/`'s own git**
+(commit `dd135b4`, on top of upstream `4b0d0cd`) for traceability via the existing
+`git_commit(REPO)` manifest mechanism — **not pushed** to `aim-uofa/AGILE` upstream (we don't
+have, and shouldn't use, write access there). `repo/` remains gitignored in our own tracked
+repo by design (vendored external checkout); this local commit is the only persistence
+mechanism for the patch, recorded here for recoverability if `repo/` is ever reset.
+
+Extended our own `scripts/run_experiment.py` (tracked in our git) with
+`CONDITIONS["D"] = {"object_max_iter_per_frame": 1600}` and the matching `result_dir`/`log_dir`
+name (`D_control_iters1600`) and `--condition` choice. This is the only change needed to make D
+a first-class condition under the exact same single-field-diff enforcement
+(`assert_single_field_diff`) already governing A/B/C.
+
+### Diagnostic logging smoke test
+
+New isolated script `scripts/run_diagnostics_smoke_test.py` + `scripts/run_diagnostics_smoke_test.sh`,
+output to `results/smoke_test_diagnostics/` (separate from `results/smoke_test/` and from
+A/B/C/D) — released config, smoke window `start_frame=10, end_frame=15` (same convention as the
+original pipeline smoke test). Validates, after a real GPU run: every JSONL line parses;
+required keys present per record type; all numeric fields finite; per-(frame_id, component)
+iteration numbers form a contiguous `0..N-1` sequence; exactly one termination record per key
+with a matching `iterations` count; and a cross-check that the count of termination records
+from the **new** mechanism exactly matches `len(runner.convergence_events)` from the
+**pre-existing, unmodified** mechanism.
+
+**Job 73232... correction, job 73366**, `short` partition, **COMPLETED, 00:12:35, exit 0:0**.
+Result: **PASSED** — 2206 total diagnostic lines, all valid; 6 distinct (frame_id, component)
+keys, each with correct contiguous iteration numbering and exactly one matching termination
+record; **6 convergence_events (old mechanism) == 6 termination records (new mechanism)**,
+confirming the new logging introduced zero divergence from the pre-existing behavior.
+
+### Condition D pre-flight validation (before submission)
+
+- `python3 scripts/run_experiment.py --condition D --check-only` (run on the login node —
+  inspection only, no GPU, no AGILE/torch import on this path): config diff vs released
+  baseline reported as exactly `['object_max_iter_per_frame']`; prerequisite checks (MANO,
+  DINO, data) passed.
+- Compared `results/D_control_iters1600/effective_config.json` against `results/A_released/`'s:
+  differs in exactly `object_max_iter_per_frame` (400->1600) and `result_dir` (the
+  intentionally-isolated infra field, identical mechanism as A/B/C's fix). `D_control_iters1600/`
+  result dir confirmed freshly created, empty of any prior training output, no collision risk
+  with A/B/C.
+- Scratch quota: 79T free / 85T total on `/scratch` - no concern for D's output (~same order of
+  magnitude as A/B/C, each a few hundred MB) or diagnostics JSONL (estimated tens of MB given
+  roughly 1600*40 + 200*40 ~ 72,000 anticipated iteration records for D, each a few hundred
+  bytes).
+- Partition load at submission time: cluster fairly busy on `a100`/`ada` from other users; job
+  submitted with the same `short,long,a100,medium,ada` multi-partition fallback used by A/B/C.
+- Runtime estimate (recorded before submission): from A (400 obj-iters, 1:12:33) vs. C (800
+  obj-iters, 1:59:23), marginal per-iteration object cost ~= (1:59:23-1:12:33)/400/40 frames ~=
+  0.176 s/iter. D adds 800 more iters/frame over C: ~800*0.176*40 ~= 94 min over C's time ->
+  estimated total **~3h30m**, comfortably inside the 8-hour walltime requested.
