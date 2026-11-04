@@ -1451,3 +1451,156 @@ Three options, none executed:
 3. Identify a different dataset/benchmark already available locally (if any) with usable GT,
    as a substitute for MC1-specific evaluation.
 No experiment or evaluation has been run beyond what was already authorized (A–E, this audit).
+
+## LOSS-LANDSCAPE AND OPTIMIZATION-DYNAMICS INVESTIGATION (2026-11-05)
+
+Read-only investigation into why the object optimizer's loss plateaus at ~iteration 100–300 and
+why Conditions D (constant LR) and E (linearly-decaying LR) converge to essentially the same
+reconstruction. No reconstruction job was run; no files were modified beyond throwaway scratch
+scripts off-repo. Built on D's and E's existing diagnostics.jsonl (71,280 and 24,480 records
+respectively) plus fresh source inspection.
+
+### A. The `ho_loss` discrepancy — resolved, not a logging bug
+Condition E's raw job stderr shows a third printed term, `ho_loss`, alongside `alpha_loss` and
+`feature_loss`, that earlier spot-checks of `diagnostics.jsonl` had not surfaced. Traced to
+source: `ho_relpose_loss=True`, `ho_relpose_loss_lambda=400.0` (`config.py:267,269`;
+`configs/ho3d.json:117-118`) is a real, heavily-weighted, actively-backpropagated loss term.
+`object_optimizer.py:392-399` sums `loss = Σ loss_dict.values()` and backpropagates it;
+`log_record` at `object_optimizer.py:492-497` captures `loss_terms={k: float(v) for k,v in
+loss_dict.items() if v is not None}` — the exact same dict, so `ho_loss` IS present in
+diagnostics wherever it is active. It is only absent for `frame_id=10` (the bidirectional
+seed/contact frame), because `ho_relpose_loss` requires a previous frame to compare against
+(`object_optimizer.py:318-321`: `if cfg.ho_relpose_loss and not is_first_frame and ...`).
+Verified empirically: all 39/40 non-seed frames carry `ho_loss` in both D's and E's logs; frame
+10 alone lacks it. **No logging gap — prior plateau analyses used all 40 frames in aggregate and
+are unaffected; this only explains why a single-frame spot-check could miss the term.**
+
+### B. Loss decomposition — `feature_loss` dominates and is the term that plateaus
+Weights: `object_mask_lambda=5.0` → `alpha_loss`; `object_feature_loss_lambda=10.0` →
+`feature_loss`; `ho_relpose_loss_lambda=400.0` → `ho_loss`. Median weighted values across all 40
+frames (D's iterations 0–399, matching E's full budget, for a fair comparison — D's and E's
+numbers agree to within ~1% at every checkpoint):
+
+| iter | alpha_loss | feature_loss | ho_loss | total | feature_loss share of total |
+|---|---|---|---|---|---|
+| 0   | 1.01 | 6.01 | 2.41 | 9.43 | 64% |
+| 50  | 0.59 | 5.76 | 0.65 | 7.01 | 82% |
+| 100 | 0.48 | 5.75 | 0.29 | 6.53 | 88% |
+| 200 | 0.40 | 5.66 | 0.21 | 6.27 | 90% |
+| 300 | 0.40 | 5.62 | 0.21 | 6.22 | 90% |
+| 399 | 0.40 | 5.55 | 0.21 | 6.15 | 90% |
+
+- **`ho_loss` resolves fast**: 2.41 → 0.21 by iteration ~150–200 (a 91% drop). Despite its large
+  nominal weight (400.0), its raw unweighted magnitude is tiny (~0.015→0.0005 m mean weighted
+  hand-vertex distance) — it is a quickly-satisfied anchor term, not the cause of the late
+  plateau.
+- **`feature_loss` dominates (82–90% of the weighted total) and is nearly flat after iteration
+  ~100** (5.75 → 5.55, a ~3.5% drop over the remaining 300 iterations). **This is the term
+  responsible for the overall plateau** — both the largest contributor and the one that stops
+  moving.
+- `alpha_loss` keeps improving slowly throughout (1.01 → 0.40, a ~60% reduction) but is a minor
+  contributor (6–10% of the total), so continued improvement there cannot move the total loss
+  much on its own.
+- Per-component gradient conflict is **not measurable** with the current diagnostics (only the
+  summed `gradient_inf` is logged, not per-term gradients) — this is an explicit logging gap,
+  not evidence either way about term conflict.
+- `feature_loss` is `mean(|1 − cosine_similarity|)` over DINOv3-feature correspondence points
+  (`utils/feature.py:125-186`), masked to non-occluded, in-bounds points; the reference
+  similarity map is refreshed only every `compute_feature_every_iter=20` iterations
+  (`config.py:218`), though the loss is computed/backpropagated against the cached map every
+  single iteration in between refreshes.
+
+### C. Optimization dynamics — genuine but incomplete flattening; convergence thresholds are miscalibrated for the object optimizer
+Median `gradient_inf` (unscaled by LR — a direct read on the loss landscape, independent of
+schedule) across the same 40 frames, D vs E:
+
+| iter | 0 | 50 | 100 | 150 | 200 | 300 | 399 |
+|---|---|---|---|---|---|---|---|
+| D | 149.5 | 18.7 | 7.0 | 2.1 | 4.0 | 3.2 | 1.23 |
+| E | 151.3 | 19.5 | 5.9 | 2.8 | 3.1 | 3.0 | 0.82 |
+
+Both show a genuine ~100–150x drop in raw gradient magnitude by iteration 300–400 — real
+flattening of the landscape, not purely an artifact of E's LR schedule (`gradient_inf` is not
+LR-scaled). **But the gradient does not vanish**: median sits at 0.8–1.2 at the final iteration,
+with individual frames spiking much higher (e.g. D's frame 20 at iter399: `gradient_inf=18.7`).
+This is a **shallow, slowly-decaying plateau region, not a hard stationary point**.
+
+**Threshold miscalibration — directly demonstrated, not inferred**: `converge_grad_tol=1e-3`
+(`config.py:323`) vs. observed object `gradient_inf` of roughly 0.8–150 throughout — the
+threshold is ~1000x smaller than the actual gradient scale, so the `'converged'` branch
+(`convergence.py:29`: requires `max(grads) < grad_tol`) is essentially unreachable for the
+object optimizer as currently configured. `'stalled_at_budget'` only checks `step_norm <
+step_tol` (`convergence.py:27-31`) — never gradient magnitude or loss stability — which is why
+E's imposed LR decay alone can flip the stalled/exhausted label without the landscape itself
+changing (consistent with the Condition E report's caveat). Confirmed empirically: **zero
+`'converged'` terminations occurred for the object optimizer across either D or E, for any
+frame.**
+
+**Contrast with the hand optimizer** (sampled frame 25, Condition E): `joints_2d_loss` is flat
+from iteration 0 (4.1290 → 4.1294 → 4.1290 — essentially no real movement even at the start of
+the run), yet `gradient_inf` fully decays toward zero (0.09 → 70 → 50 → 4.36 → 0.52 → 0.0126 by
+iteration 199) — a clean true convergence under the *same* fixed `1e-3` threshold. This shows a
+concrete scale-mismatch between the two optimizers' convergence criteria: the fixed threshold
+is reasonably matched to the hand optimizer's gradient scale but not the object optimizer's —
+this is a calibration issue specific to the object optimizer's loss/gradient magnitude, not
+evidence about hand-pose freedom or quality.
+
+### D. D vs E matched-frame comparison
+At the same iteration count (399), across all 40 common frame_ids: median `total_loss`
+percent-difference between D and E is **0.755%** (mean 1.18%, max 4.47% at frame 85). This
+closely matches the final-trajectory temporal-consistency difference already measured for
+Condition E (object rotation +0.88%, translation +0.75%) — strong internal cross-validation that
+**D and E reach essentially the same solution when compared at matched iteration count**,
+independent of which LR schedule produced it. Per-frame `gradient_inf` at iteration 399 varies
+more between D and E (e.g. frame 20: D=18.7 vs E=2.1) — consistent with D's flat-LR regime
+producing noisier late-stage gradient/step behavior that E's imposed decay smooths out, without
+that noise translating into a materially different final loss. No individual frame's difference
+(max 4.47%) is large enough to warrant a dedicated follow-up beyond flagging frame 85 as the
+largest outlier observed.
+
+### E. Bottleneck classification — demonstrated vs. plausible-but-untested, explicitly separated
+| Hypothesis | Status | Evidence |
+|---|---|---|
+| Loss saturation / insensitive dominant component | **DEMONSTRATED** | `feature_loss` is 82–90% of the weighted total and drops only ~3.5% from iteration 50→399 — simultaneously the largest contributor and the one that stops moving, directly explaining the plateau's timing. |
+| Poor conditioning / flat directions | **DEMONSTRATED** | `gradient_inf` drops ~100–150x by iteration 300 but plateaus at a nonzero median (~1–3, not →0) in both D and E, independent of schedule — a shallow-basin signature, not a scheduling artifact. |
+| Conflicting objectives | **UNTESTABLE with current diagnostics** | Only the summed `gradient_inf` is logged, not per-term gradients. An explicit logging gap, not evidence either way. |
+| Fixed convergence thresholds mis-scaled for the object optimizer | **DEMONSTRATED** | `converge_grad_tol=1e-3` is ~1000x below the observed object `gradient_inf` scale; the hand optimizer, whose gradient scale is much smaller, reaches near-zero gradient at its own plateau under the identical fixed threshold — a direct scale-calibration mismatch specific to the object optimizer. |
+| Initialization limitations (WiLoR/FoundationPose) | **PLAUSIBLE, UNTESTABLE** | No GT exists locally (per the completed GT audit) to check absolute initialization accuracy; `ho_loss`'s fast resolution is consistent with, but does not prove, a reasonable relative initialization. |
+| Insufficient object parameter freedom | **NOT SUPPORTED** | `optimize_object_scale=True` (isotropic); rotation, translation, and scale are all free parameters — this is not the limiting factor. |
+| Rendering/correspondence/visibility limitations | **PLAUSIBLE, source-supported, not isolated** | `feature_loss` masks occluded/out-of-bounds points and only refreshes its reference similarity map every 20 iterations (`compute_feature_every_iter=20`) while backpropagating every iteration against the cached map — a plausible but currently unmeasured contributor to the loss's insensitivity. |
+
+### F. Two proposed next experiments (NOT run — require explicit authorization before any job is submitted)
+
+**1. Per-component gradient instrumentation + short diagnostic run (recommended, highest
+priority).** Hypothesis: the plateau reflects a genuinely flat/insensitive `feature_loss`
+landscape, not cancellation between conflicting terms. Variable changed: add diagnostic logging
+of each loss term's own gradient norm w.r.t. object pose parameters (via a separate
+`torch.autograd.grad` call per term before the combined backward pass), in addition to the
+existing summed `gradient_inf`. Expected observations: if `feature_loss`'s own per-term gradient
+also plateaus small while its loss value stays elevated (~5.5), that confirms genuine flatness.
+If instead some per-term gradient remains large while the summed `gradient_inf` stays small,
+that would reveal term cancellation — a different, currently invisible mechanism. Compute/data:
+reuse the existing smoke-test scale (3–5 frames, same MC1 window) — purely additive
+instrumentation, isolated output directory, no new lettered reconstruction condition required.
+Directly closes the "conflicting objectives" gap identified in Parts B/E. Risk/limitation: adds
+one extra backward pass per loss term per iteration at smoke-test scale only — not something to
+run at full A–E scale without separately re-checking the compute budget.
+
+**2. Vary `compute_feature_every_iter` (20 → 1) on a short diagnostic run.** Hypothesis: part of
+the plateau is staleness in the cached feature-similarity reference map, not pure landscape
+flatness. Variable changed: that one config field only. Expected observations: if loss keeps
+improving past iteration ~300 under constant (every-iteration) refresh, staleness is a real
+contributor to the plateau; if the plateau timing is unchanged, this rules staleness out and
+reinforces the flat-landscape explanation as sufficient on its own. Compute/data: same MC1
+window, short diagnostic run only. Risk/limitation: substantially higher per-iteration compute
+(DINOv3 feature resampling becomes the per-iteration bottleneck instead of an amortized cost) —
+should be run on very few frames/iterations only, and is itself a config change requiring
+explicit sign-off before any job runs, consistent with "do not launch a new reconstruction
+experiment" scoping.
+
+### Explicit non-claims
+No reconstruction experiment was run in this investigation. No claim is made that either
+proposed experiment, if run, would necessarily change the final reconstruction — both are
+diagnostic/explanatory, aimed at distinguishing which of the DEMONSTRATED/PLAUSIBLE hypotheses
+above is the dominant mechanism, not at improving reconstruction quality directly. No ground
+truth was used or is available (per the prior GT audit) for any claim in this section.
